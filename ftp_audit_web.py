@@ -155,10 +155,53 @@ def _join(path, name):
     return path.rstrip('/') + '/' + name
 
 
+def _parse_list_line(line):
+    """解析 LIST 回傳的一行,回傳 (name, is_dir, size) 或 None。
+    支援 Unix (ls -l) 與 MS-DOS/IIS 兩種格式。"""
+    line = line.rstrip('\r\n')
+    if not line.strip():
+        return None
+    first = line[0]
+    # Unix 格式:  drwxr-xr-x  2 root root 4096 Oct 22 16:32 name
+    if first in 'd-lcbps':
+        parts = line.split(None, 8)
+        if len(parts) < 9:
+            return None
+        is_dir = (first == 'd')
+        is_link = (first == 'l')
+        try:
+            size = int(parts[4])
+        except (ValueError, IndexError):
+            size = None
+        name = parts[8]
+        if is_link:
+            name = name.split(' -> ')[0]  # 符號連結取箭頭前的名稱
+            is_dir = False                # 連結一律當檔案,避免誤遞迴
+            size = None
+        if name in ('.', '..'):
+            return None
+        return (name, is_dir, size)
+    # MS-DOS/IIS 格式:  12-05-19  10:12AM  <DIR>  name   或   ... 1024 name
+    parts = line.split(None, 3)
+    if len(parts) >= 4:
+        token, name = parts[2], parts[3]
+        if name in ('.', '..'):
+            return None
+        if token.upper() == '<DIR>':
+            return (name, True, None)
+        try:
+            return (name, False, int(token))
+        except ValueError:
+            return (name, False, None)
+    return None
+
+
 def _list_dir(ftp, path):
-    """回傳 [(name, is_dir, size)]。優先 MLSD,失敗改 NLST + SIZE 偵測。"""
-    out = []
+    """回傳 [(name, is_dir, size)]。
+    三層後備:MLSD → LIST 解析 → NLST + SIZE。"""
+    # 1) MLSD(最佳:直接提供型別與大小)
     try:
+        out = []
         for name, facts in ftp.mlsd(path or '/'):
             if name in ('.', '..'):
                 continue
@@ -168,10 +211,25 @@ def _list_dir(ftp, path):
             elif typ == 'file':
                 sz = facts.get('size')
                 out.append((name, False, int(sz) if sz and sz.isdigit() else None))
-        return out
+        if out:
+            return out
     except Exception:
         pass
-    # 後備:NLST,再用 SIZE 判斷檔案/目錄
+    # 2) LIST 解析(標準 ls -l / IIS 格式;最通用的後備)
+    try:
+        lines = []
+        ftp.retrlines('LIST ' + (path or '/'), lines.append)
+        out = []
+        for ln in lines:
+            r = _parse_list_line(ln)
+            if r:
+                out.append(r)
+        if out:
+            return out
+    except Exception:
+        pass
+    # 3) 最後手段:NLST + SIZE(nlst 會把連線切回 ASCII,故每次 SIZE 前重設二進位)
+    out = []
     try:
         names = ftp.nlst(path or '/')
     except Exception:
@@ -181,20 +239,31 @@ def _list_dir(ftp, path):
         if base in ('.', '..'):
             continue
         full = n if n.startswith('/') else _join(path, base)
+        sz, is_dir = None, False
         try:
+            ftp.voidcmd('TYPE I')  # 重設二進位,否則 SIZE 在 ASCII 模式會被拒
             sz = ftp.size(full)
-            out.append((base, sz is None, sz))
+            is_dir = (sz is None)
         except Exception:
-            out.append((base, True, None))  # SIZE 失敗 → 當作目錄
+            # 無法判定:用副檔名輔助 — 有已知副檔名就當檔案,否則當目錄
+            ext = os.path.splitext(base)[1].lower()
+            is_dir = ext not in IMAGE_EXTS and ext not in PDF_EXTS
+        out.append((base, is_dir, sz))
     return out
 
 
-def walk_ftp(ftp, start='/', max_depth=MAX_DEPTH, max_files=MAX_FILES_PER_HOST):
+def walk_ftp(ftp, start=None, max_depth=MAX_DEPTH, max_files=MAX_FILES_PER_HOST):
     """遞迴掃描,收集 PDF 與圖片檔。"""
     try:
         ftp.voidcmd('TYPE I')  # 二進位模式,SIZE 才可用
     except Exception:
         pass
+    if start is None:
+        # 從登入後的目錄起掃(非 chroot 的伺服器,家目錄未必是 '/')
+        try:
+            start = ftp.pwd() or '/'
+        except Exception:
+            start = '/'
     found = []
     visited = set()
     stack = [(start, 0)]
