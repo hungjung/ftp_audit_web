@@ -65,8 +65,9 @@ def main():
         print("  MLSD 不支援或失敗:", repr(e))
     print("=" * 60)
 
-    # LIST(目前目錄,無參數)
-    print("[LIST(無參數,CWD 當前目錄)原始輸出]")
+    # LIST(被動模式 PASV,ftplib 預設)
+    print("[LIST — 被動模式 PASV(ftplib 預設)]")
+    f.set_pasv(True)
     try:
         lines = []
         f.retrlines('LIST', lines.append)
@@ -75,7 +76,26 @@ def main():
         if not lines:
             print("  (LIST 回傳空白)")
     except Exception as e:
-        print("  LIST 失敗:", repr(e))
+        print("  被動模式 LIST 失敗:", repr(e))
+    print("=" * 60)
+
+    # LIST(主動模式 PORT)—— 若被動失敗,這裡成功就代表要改用主動模式
+    print("[LIST — 主動模式 PORT(被動失敗時的替代)]")
+    try:
+        f2 = ftplib.FTP()
+        f2.encoding = 'latin-1'
+        f2.connect(host, port, timeout=10)
+        f2.login(user, pwd)
+        f2.set_pasv(False)
+        lines = []
+        f2.retrlines('LIST', lines.append)
+        for l in lines[:40]:
+            print("  |" + l)
+        if not lines:
+            print("  (LIST 回傳空白)")
+        f2.quit()
+    except Exception as e:
+        print("  主動模式 LIST 失敗:", repr(e))
     print("=" * 60)
 
     # LIST(帶絕對路徑)

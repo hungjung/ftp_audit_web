@@ -274,6 +274,33 @@ def _list_dir(ftp, path):
     return out
 
 
+def scan_with_fallback(host, port, user, password, timeout):
+    """掃描檔案,自動在 PASV(被動)與 PORT(主動)模式間選擇可用者。
+    回傳 (files, passive)。兩種模式都失敗則拋出例外(避免默默回 0)。"""
+    last_err = None
+    for passive in (True, False):
+        try:
+            ftp = ftp_connect(host, port, user, password, timeout)
+        except Exception as e:
+            last_err = e
+            continue
+        try:
+            ftp.set_pasv(passive)
+            # 探測:此模式下資料連線是否可用(列一次當前目錄)
+            ftp.retrlines('LIST', lambda _l: None)
+        except Exception as e:
+            last_err = e
+            _close(ftp)
+            continue
+        # 此模式可用 → 正式掃描
+        try:
+            files = walk_ftp(ftp)
+            return files, passive
+        finally:
+            _close(ftp)
+    raise IOError('資料連線在 PASV 與 PORT 模式皆失敗 (%s)' % last_err)
+
+
 def walk_ftp(ftp, start=None, max_depth=MAX_DEPTH, max_files=MAX_FILES_PER_HOST):
     """遞迴掃描,收集 PDF 與圖片檔。"""
     try:
@@ -316,7 +343,7 @@ def walk_ftp(ftp, start=None, max_depth=MAX_DEPTH, max_files=MAX_FILES_PER_HOST)
 # ------------------------- 主機稽核 -------------------------
 def audit_host(host, port, creds, timeout):
     res = {'host': host, 'port': port, 'reachable': False, 'anonymous': False,
-           'weak_creds': [], 'login_user': None, 'login_pass': None,
+           'weak_creds': [], 'login_user': None, 'login_pass': None, 'passive': True,
            'pdf_count': 0, 'image_count': 0, 'files': [], 'error': ''}
 
     # 連線測試
@@ -349,11 +376,8 @@ def audit_host(host, port, creds, timeout):
     if working:
         res['login_user'], res['login_pass'] = working
         try:
-            ftp = ftp_connect(host, port, working[0], working[1], timeout)
-            try:
-                files = walk_ftp(ftp)
-            finally:
-                _close(ftp)
+            files, passive = scan_with_fallback(host, port, working[0], working[1], timeout)
+            res['passive'] = passive
             for f in files:
                 f['id'] = uuid.uuid4().hex
             res['files'] = files
@@ -391,23 +415,35 @@ def _find_file(job, file_id):
     return None, None
 
 
-def download_ftp_file(host, port, user, password, path, timeout, max_bytes):
-    ftp = ftp_connect(host, port, user, password, timeout)
-    buf = io.BytesIO()
-    state = {'n': 0}
+def download_ftp_file(host, port, user, password, path, timeout, max_bytes, passive=True):
+    """下載單一檔案;先試記錄到的模式,失敗再試另一模式。"""
+    last_err = None
+    for pasv in (passive, not passive):
+        ftp = ftp_connect(host, port, user, password, timeout)
+        ftp.set_pasv(pasv)
+        buf = io.BytesIO()
+        state = {'n': 0}
 
-    def cb(data):
-        state['n'] += len(data)
-        if state['n'] > max_bytes:
-            raise IOError('file exceeds preview limit')
-        buf.write(data)
+        def cb(data):
+            state['n'] += len(data)
+            if state['n'] > max_bytes:
+                raise IOError('file exceeds preview limit')
+            buf.write(data)
 
-    try:
-        ftp.voidcmd('TYPE I')
-        ftp.retrbinary('RETR ' + path, cb)
-    finally:
-        _close(ftp)
-    return buf.getvalue()
+        try:
+            ftp.voidcmd('TYPE I')
+            ftp.retrbinary('RETR ' + path, cb)
+            return buf.getvalue()
+        except IOError as e:
+            if 'exceeds preview limit' in str(e):
+                _close(ftp)
+                raise  # 超過大小上限不是模式問題,直接往外拋
+            last_err = e
+        except Exception as e:
+            last_err = e
+        finally:
+            _close(ftp)
+    raise IOError('下載失敗 (PASV/PORT 皆不可用): %s' % last_err)
 
 
 # ------------------------- Flask 路由 -------------------------
@@ -485,7 +521,8 @@ def _serve_file(job_id, file_id, as_attachment):
         abort(404)
     try:
         data = download_ftp_file(r['host'], r['port'], r['login_user'], r['login_pass'],
-                                 f['path'], timeout=15, max_bytes=PREVIEW_MAX_BYTES)
+                                 f['path'], timeout=15, max_bytes=PREVIEW_MAX_BYTES,
+                                 passive=r.get('passive', True))
     except Exception as e:
         return Response('取得檔案失敗: %s' % e, status=502, mimetype='text/plain')
     ct = CONTENT_TYPES.get(f['ext'], 'application/octet-stream')
