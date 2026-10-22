@@ -12,6 +12,8 @@ FTP 診斷腳本 —— 當 Web 工具檔案計數為 0 時,用這支對「單�
 只讀取目錄列表,不下載、不修改任何檔案。
 """
 import ftplib
+import re
+import socket
 import sys
 
 
@@ -79,20 +81,66 @@ def main():
         print("  被動模式 LIST 失敗:", repr(e))
     print("=" * 60)
 
-    # LIST(主動模式 PORT)—— 若被動失敗,這裡成功就代表要改用主動模式
-    print("[LIST — 主動模式 PORT(被動失敗時的替代)]")
+    # 被動模式:挖出伺服器回報的 PASV 位址,並測試資料埠可達性
+    print("[PASV 位址分析]")
+    control_ip = None
     try:
-        f2 = ftplib.FTP()
-        f2.encoding = 'latin-1'
-        f2.connect(host, port, timeout=10)
-        f2.login(user, pwd)
-        f2.set_pasv(False)
+        control_ip = f.sock.getpeername()[0]
+        print("  控制連線實際 IP =", control_ip)
+    except Exception as e:
+        print("  取得控制 IP 失敗:", e)
+    adv_ip, adv_port = None, None
+    try:
+        resp = f.sendcmd('PASV')
+        print("  PASV 原始回應 =", resp)
+        mobj = re.search(r'(\d+),(\d+),(\d+),(\d+),(\d+),(\d+)', resp)
+        if mobj:
+            nums = list(map(int, mobj.groups()))
+            adv_ip = '%d.%d.%d.%d' % tuple(nums[:4])
+            adv_port = nums[4] * 256 + nums[5]
+            print("  伺服器回報資料位址 =", adv_ip, "port", adv_port)
+            if control_ip and adv_ip != control_ip:
+                print("  ⚠ 回報位址與控制 IP 不同 → 可能是 NAT 誤報(改用控制 IP 或許可解)")
+        for label, ip in (("回報位址", adv_ip), ("控制 IP", control_ip)):
+            if not ip or not adv_port:
+                continue
+            s = socket.socket(); s.settimeout(6)
+            r = s.connect_ex((ip, adv_port)); s.close()
+            print("  TCP 連 %s %s:%d -> %s" % (label, ip, adv_port,
+                  "可連" if r == 0 else "不可連 (errno %d)" % r))
+    except Exception as e:
+        print("  PASV 分析失敗:", repr(e))
+    print("=" * 60)
+
+    # LIST — 被動 + 改用控制連線 IP(修 NAT 誤報)
+    print("[LIST — 被動模式 + 改用控制連線 IP]")
+    try:
+        class _OverrideFTP(ftplib.FTP):
+            def makepasv(self):
+                h, p = super().makepasv()
+                return self.sock.getpeername()[0], p  # 忽略回報 IP,改用控制 IP
+        f3 = _OverrideFTP(); f3.encoding = 'latin-1'
+        f3.connect(host, port, timeout=10); f3.login(user, pwd); f3.set_pasv(True)
+        lines = []
+        f3.retrlines('LIST', lines.append)
+        for l in lines[:40]:
+            print("  |" + l)
+        print("  → 此法%s" % ("成功!(工具會自動採用)" if lines else "回傳空白"))
+        f3.quit()
+    except Exception as e:
+        print("  被動+控制IP LIST 失敗:", repr(e))
+    print("=" * 60)
+
+    # LIST — 主動模式 PORT
+    print("[LIST — 主動模式 PORT]")
+    try:
+        f2 = ftplib.FTP(); f2.encoding = 'latin-1'
+        f2.connect(host, port, timeout=10); f2.login(user, pwd); f2.set_pasv(False)
         lines = []
         f2.retrlines('LIST', lines.append)
         for l in lines[:40]:
             print("  |" + l)
-        if not lines:
-            print("  (LIST 回傳空白)")
+        print("  → 此法%s" % ("成功!" if lines else "回傳空白"))
         f2.quit()
     except Exception as e:
         print("  主動模式 LIST 失敗:", repr(e))
@@ -123,7 +171,13 @@ def main():
         print("  NLST 失敗:", repr(e))
     print("=" * 60)
 
-    f.quit()
+    try:
+        f.quit()
+    except Exception:
+        try:
+            f.close()
+        except Exception:
+            pass
     print("診斷完成。請把以上整段輸出貼回。")
 
 

@@ -41,6 +41,7 @@ import os
 import re
 import socket
 import threading
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -91,13 +92,41 @@ def _close(ftp):
             pass
 
 
+class _RobustFTP(ftplib.FTP):
+    """可選擇性把被動模式的資料連線導向『控制連線的 IP』。
+    對多網卡 / NAT 下 PASV 回報錯誤位址而造成 426 的伺服器特別有效。"""
+    _use_control_host = False
+
+    def makepasv(self):
+        host, port = super().makepasv()
+        if self._use_control_host:
+            try:
+                host = self.sock.getpeername()[0]  # 改用控制連線對端(必然可達)
+            except Exception:
+                pass
+        return host, port
+
+
+# 資料連線模式(由可靠到保底):被動 → 被動+控制IP覆寫 → 主動
+DATA_MODES = [
+    {'label': 'PASV',          'passive': True,  'ctrl_host': False},
+    {'label': 'PASV+控制IP',    'passive': True,  'ctrl_host': True},
+    {'label': 'PORT(主動)',    'passive': False, 'ctrl_host': False},
+]
+
+
 def ftp_connect(host, port, user, password, timeout):
     """建立並登入 FTP 連線(encoding 用 latin-1 避免檔名解碼錯誤)。"""
-    ftp = ftplib.FTP()
+    ftp = _RobustFTP()
     ftp.encoding = 'latin-1'
     ftp.connect(host, port, timeout=timeout)
     ftp.login(user, password)
     return ftp
+
+
+def _apply_mode(ftp, mode):
+    ftp._use_control_host = mode.get('ctrl_host', False)
+    ftp.set_pasv(mode.get('passive', True))
 
 
 def try_login(host, port, user, password, timeout):
@@ -157,6 +186,19 @@ def _join(path, name):
     if not path or path == '/':
         return '/' + name
     return path.rstrip('/') + '/' + name
+
+
+def _display_name(name):
+    """連線用 latin-1 解碼;若檔名其實是 Big5/CP950,還原成可讀中文供顯示。
+    (FTP 指令仍用原始 latin-1 字串,確保下載路徑位元組正確)"""
+    try:
+        decoded = name.encode('latin-1').decode('cp950')
+        # 僅在解出非 ASCII(即確實是中文)時採用,避免誤判
+        if any(ord(c) > 127 for c in decoded):
+            return decoded
+    except Exception:
+        pass
+    return name
 
 
 def _parse_list_line(line):
@@ -275,30 +317,35 @@ def _list_dir(ftp, path):
 
 
 def scan_with_fallback(host, port, user, password, timeout):
-    """掃描檔案,自動在 PASV(被動)與 PORT(主動)模式間選擇可用者。
-    回傳 (files, passive)。兩種模式都失敗則拋出例外(避免默默回 0)。"""
+    """掃描檔案,依序嘗試多種資料連線模式,選第一個可用者。
+    回傳 (files, mode)。全部失敗則拋出例外(避免默默回 0)。"""
     last_err = None
-    for passive in (True, False):
-        try:
-            ftp = ftp_connect(host, port, user, password, timeout)
-        except Exception as e:
-            last_err = e
-            continue
-        try:
-            ftp.set_pasv(passive)
-            # 探測:此模式下資料連線是否可用(列一次當前目錄)
-            ftp.retrlines('LIST', lambda _l: None)
-        except Exception as e:
-            last_err = e
-            _close(ftp)
-            continue
-        # 此模式可用 → 正式掃描
-        try:
-            files = walk_ftp(ftp)
-            return files, passive
-        finally:
-            _close(ftp)
-    raise IOError('資料連線在 PASV 與 PORT 模式皆失敗 (%s)' % last_err)
+    for mode in DATA_MODES:
+        # 被動模式重試 2 次:有些防火牆/ALG 的固定被動埠需「先敲一次才開孔」,
+        # 第一次 426、第二次才通。主動模式只試 1 次(失敗多為逾時,重試只是空等)。
+        tries = 2 if mode['passive'] else 1
+        for attempt in range(tries):
+            try:
+                ftp = ftp_connect(host, port, user, password, timeout)
+            except Exception as e:
+                last_err = e
+                break  # 控制連線都建不起來,換下一模式
+            try:
+                _apply_mode(ftp, mode)
+                ftp.retrlines('LIST', lambda _l: None)  # 探測此模式資料連線
+            except Exception as e:
+                last_err = '%s(第%d次): %s' % (mode['label'], attempt + 1, e)
+                _close(ftp)
+                if attempt + 1 < tries:
+                    time.sleep(0.4)
+                continue
+            # 此模式可用 → 正式掃描
+            try:
+                files = walk_ftp(ftp)
+                return files, mode
+            finally:
+                _close(ftp)
+    raise IOError('資料連線在所有模式皆失敗 (最後錯誤 %s)' % last_err)
 
 
 def walk_ftp(ftp, start=None, max_depth=MAX_DEPTH, max_files=MAX_FILES_PER_HOST):
@@ -333,7 +380,8 @@ def walk_ftp(ftp, start=None, max_depth=MAX_DEPTH, max_files=MAX_FILES_PER_HOST)
                 kind = 'pdf'
             else:
                 continue
-            found.append({'path': _join(path, name), 'name': name,
+            found.append({'path': _join(path, name),      # 原始位元組路徑,供 FTP RETR
+                          'name': _display_name(name),     # 還原後的可讀檔名,供 UI 顯示
                           'ext': ext, 'kind': kind, 'size': size})
             if len(found) >= max_files:
                 break
@@ -343,7 +391,7 @@ def walk_ftp(ftp, start=None, max_depth=MAX_DEPTH, max_files=MAX_FILES_PER_HOST)
 # ------------------------- 主機稽核 -------------------------
 def audit_host(host, port, creds, timeout):
     res = {'host': host, 'port': port, 'reachable': False, 'anonymous': False,
-           'weak_creds': [], 'login_user': None, 'login_pass': None, 'passive': True,
+           'weak_creds': [], 'login_user': None, 'login_pass': None, 'dmode': None,
            'pdf_count': 0, 'image_count': 0, 'files': [], 'error': ''}
 
     # 連線測試
@@ -376,8 +424,8 @@ def audit_host(host, port, creds, timeout):
     if working:
         res['login_user'], res['login_pass'] = working
         try:
-            files, passive = scan_with_fallback(host, port, working[0], working[1], timeout)
-            res['passive'] = passive
+            files, mode = scan_with_fallback(host, port, working[0], working[1], timeout)
+            res['dmode'] = mode
             for f in files:
                 f['id'] = uuid.uuid4().hex
             res['files'] = files
@@ -415,12 +463,20 @@ def _find_file(job, file_id):
     return None, None
 
 
-def download_ftp_file(host, port, user, password, path, timeout, max_bytes, passive=True):
-    """下載單一檔案;先試記錄到的模式,失敗再試另一模式。"""
+def download_ftp_file(host, port, user, password, path, timeout, max_bytes, dmode=None):
+    """下載單一檔案;先試掃描時記錄到的資料連線模式,失敗再試其餘模式。"""
+    # 先試掃描成功時用的模式,再補上其餘模式(去重)
+    modes = []
+    if dmode:
+        modes.append(dmode)
+    for m in DATA_MODES:
+        if m not in modes:
+            modes.append(m)
+
     last_err = None
-    for pasv in (passive, not passive):
+    for mode in modes:
         ftp = ftp_connect(host, port, user, password, timeout)
-        ftp.set_pasv(pasv)
+        _apply_mode(ftp, mode)
         buf = io.BytesIO()
         state = {'n': 0}
 
@@ -443,7 +499,7 @@ def download_ftp_file(host, port, user, password, path, timeout, max_bytes, pass
             last_err = e
         finally:
             _close(ftp)
-    raise IOError('下載失敗 (PASV/PORT 皆不可用): %s' % last_err)
+    raise IOError('下載失敗 (所有資料連線模式皆不可用): %s' % last_err)
 
 
 # ------------------------- Flask 路由 -------------------------
@@ -505,6 +561,7 @@ def status(job_id):
                 'anonymous': r['anonymous'], 'weak_creds': r['weak_creds'],
                 'pdf_count': r['pdf_count'], 'image_count': r['image_count'],
                 'error': r['error'],
+                'dmode': r['dmode']['label'] if r.get('dmode') else None,
                 'files': [{'id': f['id'], 'name': f['name'], 'path': f['path'],
                            'kind': f['kind'], 'size': f['size']} for f in r.get('files', [])],
             })
@@ -522,7 +579,7 @@ def _serve_file(job_id, file_id, as_attachment):
     try:
         data = download_ftp_file(r['host'], r['port'], r['login_user'], r['login_pass'],
                                  f['path'], timeout=15, max_bytes=PREVIEW_MAX_BYTES,
-                                 passive=r.get('passive', True))
+                                 dmode=r.get('dmode'))
     except Exception as e:
         return Response('取得檔案失敗: %s' % e, status=502, mimetype='text/plain')
     ct = CONTENT_TYPES.get(f['ext'], 'application/octet-stream')
@@ -710,7 +767,8 @@ function hostCard(r,isVuln){
   if(r.anonymous||r.weak_creds.length)
     html+='<div class="small text-secondary">'+
       '<i class="bi bi-file-earmark-pdf"></i> PDF <b class="text-body">'+r.pdf_count+'</b> 個　'+
-      '<i class="bi bi-image"></i> 圖片 <b class="text-body">'+r.image_count+'</b> 個</div>';
+      '<i class="bi bi-image"></i> 圖片 <b class="text-body">'+r.image_count+'</b> 個'+
+      (r.dmode?'　<span class="badge text-bg-secondary">資料連線:'+esc(r.dmode)+'</span>':'')+'</div>';
   html+='</div>';
   d.innerHTML=html;
 
