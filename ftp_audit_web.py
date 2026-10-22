@@ -262,11 +262,19 @@ def _parse_list_line(line):
 
 def _list_dir(ftp, path):
     """回傳 [(name, is_dir, size)]。
+    先 CWD 切進目標目錄,再用『不帶參數』的指令列出 —— 有些伺服器不接受
+    LIST/MLSD/NLST 帶路徑(會回 426 或錯誤),只接受列出當前目錄。
     三層後備:MLSD → LIST 解析 → NLST + SIZE。"""
-    # 1) MLSD(最佳:直接提供型別與大小)
+    # 先切換到目標目錄;切不進去就當作無法列出
+    try:
+        ftp.cwd(path or '/')
+    except Exception:
+        return []
+
+    # 1) MLSD(不帶參數,列當前目錄)
     try:
         out = []
-        for name, facts in ftp.mlsd(path or '/'):
+        for name, facts in ftp.mlsd():
             if name in ('.', '..'):
                 continue
             typ = facts.get('type', '')
@@ -279,10 +287,10 @@ def _list_dir(ftp, path):
             return out
     except Exception:
         pass
-    # 2) LIST 解析(標準 ls -l / IIS 格式;最通用的後備)
+    # 2) LIST(不帶參數)解析(標準 ls -l / IIS 格式;最通用的後備)
     try:
         lines = []
-        ftp.retrlines('LIST ' + (path or '/'), lines.append)
+        ftp.retrlines('LIST', lines.append)
         out = []
         for ln in lines:
             r = _parse_list_line(ln)
@@ -292,21 +300,20 @@ def _list_dir(ftp, path):
             return out
     except Exception:
         pass
-    # 3) 最後手段:NLST + SIZE(nlst 會把連線切回 ASCII,故每次 SIZE 前重設二進位)
+    # 3) 最後手段:NLST(不帶參數)+ SIZE
     out = []
     try:
-        names = ftp.nlst(path or '/')
+        names = ftp.nlst()
     except Exception:
         return out
     for n in names:
         base = n.rsplit('/', 1)[-1]
         if base in ('.', '..'):
             continue
-        full = n if n.startswith('/') else _join(path, base)
         sz, is_dir = None, False
         try:
             ftp.voidcmd('TYPE I')  # 重設二進位,否則 SIZE 在 ASCII 模式會被拒
-            sz = ftp.size(full)
+            sz = ftp.size(base)
             is_dir = (sz is None)
         except Exception:
             # 無法判定:用副檔名輔助 — 有已知副檔名就當檔案,否則當目錄
@@ -473,6 +480,10 @@ def download_ftp_file(host, port, user, password, path, timeout, max_bytes, dmod
         if m not in modes:
             modes.append(m)
 
+    # 拆成目錄 + 檔名:先 CWD 再 RETR 檔名(與列目錄一致,相容不接受帶路徑的伺服器)
+    d, base = path.rsplit('/', 1)
+    d = d or '/'
+
     last_err = None
     for mode in modes:
         ftp = ftp_connect(host, port, user, password, timeout)
@@ -488,7 +499,11 @@ def download_ftp_file(host, port, user, password, path, timeout, max_bytes, dmod
 
         try:
             ftp.voidcmd('TYPE I')
-            ftp.retrbinary('RETR ' + path, cb)
+            try:
+                ftp.cwd(d)
+            except Exception:
+                pass
+            ftp.retrbinary('RETR ' + base, cb)
             return buf.getvalue()
         except IOError as e:
             if 'exceeds preview limit' in str(e):
