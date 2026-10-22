@@ -4,10 +4,11 @@
 FTP 安全稽核 Web 工具 (ftp_audit_web.py)
 ---------------------------------------------------------------
 功能:
-  1. 網頁上傳「IP 清單 (TXT)」與「字典檔 (TXT)」
+  1. 網頁上傳「IP 清單 (TXT)」與「字典檔 (TXT)」;IP 清單支援 CIDR 網段展開
   2. 檢測 FTP 匿名登入 / 弱密碼
   3. 登入成功後遞迴掃描目錄,找出 PDF 與圖片檔並統計數量
   4. 可在網頁上直接「預覽」與「下載」掃到的檔案
+  5. 掃描結果可一鍵匯出 CSV / HTML 報告
 
 用途:僅限對「自己機關擁有或已取得書面授權」的主機進行資安稽核。
      未經授權對他人系統進行密碼嘗試在多數司法管轄區屬違法行為。
@@ -35,8 +36,10 @@ FTP 安全稽核 Web 工具 (ftp_audit_web.py)
 """
 
 import argparse
+import csv as _csv
 import ftplib
 import io
+import ipaddress
 import os
 import re
 import socket
@@ -44,6 +47,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from html import escape as _esc
 
 _MONTHS = {'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
            'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'}
@@ -175,6 +179,33 @@ def parse_target(line):
         except ValueError:
             return (h.strip(), None)
     return (line, None)
+
+
+# CIDR 單一網段最多展開的主機數(避免誤填 /8 這類巨大網段)
+MAX_CIDR_HOSTS = 4096
+
+
+def expand_line(line, default_port):
+    """把一行展開為 [(host, port), ...]。
+    支援:單一 IP、ip:port、以及 CIDR 網段(如 192.168.1.0/24)。
+    回傳 (targets, note);note 為非空字串時代表有提示(如網段過大被截斷)。"""
+    line = line.strip()
+    # CIDR 網段(IPv4/IPv6);不含 port
+    if '/' in line and line.count(':') == 0:
+        try:
+            net = ipaddress.ip_network(line, strict=False)
+        except ValueError:
+            return [], ''  # 非合法網段,略過
+        # /31、/32(或 IPv6 對應)含全部位址;其餘用 hosts() 排除網路/廣播位址
+        hosts = list(net) if net.num_addresses <= 2 else list(net.hosts())
+        note = ''
+        if len(hosts) > MAX_CIDR_HOSTS:
+            hosts = hosts[:MAX_CIDR_HOSTS]
+            note = '%s 展開超過上限,只取前 %d 台' % (line, MAX_CIDR_HOSTS)
+        return [(str(ip), default_port) for ip in hosts], note
+    # 單一 IP / ip:port
+    h, p = parse_target(line)
+    return [(h, p if p else default_port)], ''
 
 
 def parse_creds(data, max_creds):
@@ -607,11 +638,17 @@ def scan():
 
     raw = parse_lines(ip_file.read())
     targets = []
+    seen = set()
+    notes = []
     for ln in raw:
-        t = parse_target(ln)
-        if t:
-            h, p = t
-            targets.append((h, p if p else default_port))
+        expanded, note = expand_line(ln, default_port)
+        if note:
+            notes.append(note)
+        for h, p in expanded:
+            key = (h, p)
+            if key not in seen:   # 去重(CIDR 展開可能與單筆重疊)
+                seen.add(key)
+                targets.append(key)
     if not targets:
         return jsonify({'error': 'IP 清單為空或格式錯誤'}), 400
 
@@ -624,11 +661,13 @@ def scan():
 
     job_id = uuid.uuid4().hex
     JOBS[job_id] = {'status': 'running', 'total': len(targets), 'done': 0,
-                    'results': [], 'cred_count': len(creds), 'truncated': truncated}
+                    'results': [], 'cred_count': len(creds), 'truncated': truncated,
+                    'notes': notes, 'started': time.strftime('%Y-%m-%d %H:%M:%S')}
     threading.Thread(target=run_scan, args=(job_id, targets, creds, timeout, threads),
                      daemon=True).start()
     return jsonify({'job_id': job_id, 'total': len(targets),
-                    'cred_count': len(creds), 'truncated': truncated})
+                    'cred_count': len(creds), 'truncated': truncated,
+                    'notes': notes})
 
 
 @app.route('/status/<job_id>')
@@ -686,6 +725,146 @@ def download(job_id, file_id):
     return _serve_file(job_id, file_id, as_attachment=True)
 
 
+# ------------------------- 報告匯出 -------------------------
+def _mode_label(r):
+    d = r.get('dmode')
+    return d['label'] if isinstance(d, dict) and d.get('label') else ''
+
+
+@app.route('/report/<job_id>.csv')
+def report_csv(job_id):
+    job = JOBS.get(job_id)
+    if not job or job['status'] != 'done':
+        abort(404)
+    buf = io.StringIO()
+    w = _csv.writer(buf)
+    w.writerow(['host', 'port', 'reachable', 'anonymous', 'weak_creds',
+                'pdf_count', 'image_count', 'data_mode', 'error',
+                'file_kind', 'file_name', 'file_path', 'file_size'])
+    for r in job['results']:
+        base = [r['host'], r['port'], r['reachable'], r['anonymous'],
+                ';'.join(r.get('weak_creds', [])), r.get('pdf_count', 0),
+                r.get('image_count', 0), _mode_label(r), r.get('error', '')]
+        files = r.get('files', [])
+        if files:
+            for f in files:
+                w.writerow(base + [f['kind'], f['name'], f['path'], f.get('size', '')])
+        else:
+            w.writerow(base + ['', '', '', ''])
+    data = '﻿' + buf.getvalue()  # BOM,Excel 正確辨識 UTF-8
+    return Response(data, mimetype='text/csv; charset=utf-8',
+                    headers={'Content-Disposition':
+                             'attachment; filename="ftp_audit_%s.csv"' % job_id[:8]})
+
+
+@app.route('/report/<job_id>.html')
+def report_html(job_id):
+    job = JOBS.get(job_id)
+    if not job or job['status'] != 'done':
+        abort(404)
+    results = job['results']
+    vuln = [r for r in results if r['anonymous'] or r['weak_creds']]
+    okup = [r for r in results if r['reachable'] and not r['anonymous'] and not r['weak_creds']]
+    down = [r for r in results if not r['reachable']]
+    tot_pdf = sum(r.get('pdf_count', 0) for r in vuln)
+    tot_img = sum(r.get('image_count', 0) for r in vuln)
+
+    def host_block(r):
+        tags = []
+        if not r['reachable']:
+            tags.append('<span class="tag off">無法連線</span>')
+        else:
+            if r['anonymous']:
+                tags.append('<span class="tag anon">匿名登入</span>')
+            if r['weak_creds']:
+                tags.append('<span class="tag weak">弱密碼</span>')
+            if not r['anonymous'] and not r['weak_creds']:
+                tags.append('<span class="tag ok">正常</span>')
+        h = '<div class="host%s"><h3>%s:%s %s</h3>' % (
+            ' v' if (r['anonymous'] or r['weak_creds']) else '',
+            _esc(str(r['host'])), r['port'], ''.join(tags))
+        if r.get('error'):
+            h += '<div class="muted">%s</div>' % _esc(str(r['error']))
+        if r['weak_creds']:
+            h += '<div class="creds">弱密碼:%s</div>' % _esc('　'.join(r['weak_creds']))
+        if r['anonymous'] or r['weak_creds']:
+            h += '<div class="muted">PDF <b>%d</b> 個 · 圖片 <b>%d</b> 個　資料連線:%s</div>' % (
+                r.get('pdf_count', 0), r.get('image_count', 0), _esc(_mode_label(r)))
+        files = r.get('files', [])
+        if files:
+            rows = ''.join(
+                '<tr><td>%s</td><td>%s</td><td class="mono">%s</td><td>%s</td></tr>' % (
+                    f['kind'], _esc(f['name']), _esc(f['path']),
+                    _fmt_size(f.get('size')))
+                for f in files)
+            h += ('<table><tr><th>類型</th><th>檔名</th><th>路徑</th><th>大小</th></tr>'
+                  + rows + '</table>')
+        return h + '</div>'
+
+    body = ''.join(host_block(r) for r in (vuln + okup + down))
+    html = _REPORT_TMPL % {
+        'time': job.get('started', ''),
+        'total': len(results), 'vuln': len(vuln), 'ok': len(okup), 'down': len(down),
+        'pdf': tot_pdf, 'img': tot_img, 'body': body,
+    }
+    return Response(html, mimetype='text/html; charset=utf-8',
+                    headers={'Content-Disposition':
+                             'attachment; filename="ftp_audit_%s.html"' % job_id[:8]})
+
+
+def _fmt_size(n):
+    if n is None or n == '':
+        return ''
+    try:
+        n = int(n)
+    except (ValueError, TypeError):
+        return str(n)
+    if n < 1024:
+        return '%d B' % n
+    if n < 1048576:
+        return '%.1f KB' % (n / 1024)
+    return '%.1f MB' % (n / 1048576)
+
+
+# 自成一體、不依賴外網的 HTML 報告模板
+_REPORT_TMPL = """<!doctype html>
+<html lang="zh-Hant"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FTP 資安稽核報告</title>
+<style>
+ body{font-family:system-ui,"Noto Sans TC","Microsoft JhengHei",sans-serif;
+      margin:0;background:#0e131b;color:#e3e8ef}
+ .wrap{max-width:1000px;margin:0 auto;padding:24px}
+ h1{font-size:20px} h3{font-size:15px;font-family:ui-monospace,monospace;margin:0 0 8px}
+ .sum{display:flex;flex-wrap:wrap;gap:10px;margin:14px 0 22px}
+ .sum span{background:#1a2230;border:1px solid #2a3545;border-radius:8px;padding:6px 12px;font-size:13px}
+ .host{border:1px solid #2a3545;border-radius:10px;padding:14px 16px;margin-bottom:12px;background:#141b26}
+ .host.v{border-left:4px solid #f87171}
+ .tag{font-size:11.5px;padding:2px 9px;border-radius:99px;font-weight:700;margin-left:6px}
+ .anon{background:#3b2a05;color:#fbbf24} .weak{background:#3a1218;color:#f87171}
+ .ok{background:#10281a;color:#4ade80} .off{background:#1e2530;color:#8491a5}
+ .muted{color:#8491a5;font-size:13px;margin:4px 0} .muted b{color:#e3e8ef}
+ .creds{font-family:ui-monospace,monospace;font-size:12.5px;color:#f87171;margin:4px 0}
+ table{width:100%%;border-collapse:collapse;margin-top:10px;font-size:12.5px}
+ th,td{text-align:left;padding:5px 8px;border-bottom:1px solid #222c3a}
+ th{color:#8491a5;font-weight:600} .mono{font-family:ui-monospace,monospace;color:#9fb0c7}
+ .warn{color:#fbbf24;font-size:12.5px}
+ .foot{color:#60708a;font-size:12px;margin-top:24px}
+</style></head><body><div class="wrap">
+ <h1>🛡️ FTP 資安稽核報告</h1>
+ <div class="warn">⚠ 僅限對已獲授權之機關主機使用　|　產生時間:%(time)s</div>
+ <div class="sum">
+   <span>共 <b>%(total)d</b> 台</span>
+   <span>發現問題 <b>%(vuln)d</b> 台</span>
+   <span>無問題 <b>%(ok)d</b> 台</span>
+   <span>無法連線 <b>%(down)d</b> 台</span>
+   <span>合計 PDF <b>%(pdf)d</b> · 圖片 <b>%(img)d</b></span>
+ </div>
+ %(body)s
+ <div class="foot">由 FTP 資安稽核 Web 工具產生。</div>
+</div></body></html>"""
+
+
 # ------------------------- 前端頁面 -------------------------
 PAGE = """<!doctype html>
 <html lang="zh-Hant" data-bs-theme="dark">
@@ -719,7 +898,7 @@ PAGE = """<!doctype html>
       <form id="f">
         <div class="row g-3">
           <div class="col-12">
-            <label class="form-label">IP 清單檔 (TXT,每行一個 IP,可用 ip:port) <span class="text-danger">*必填</span></label>
+            <label class="form-label">IP 清單檔 (TXT,每行一個 IP,可用 ip:port 或 CIDR 網段如 192.168.1.0/24) <span class="text-danger">*必填</span></label>
             <input class="form-control" type="file" name="ips" accept=".txt" required>
           </div>
           <div class="col-12">
@@ -784,8 +963,9 @@ $("#f").addEventListener("submit", async e=>{
   catch(_){ $("#progtxt").textContent="無法連線到伺服器"; $("#go").disabled=false; return; }
   if(r.error){ $("#progtxt").textContent="錯誤:"+r.error; $("#go").disabled=false; return; }
   jobId=r.job_id;
-  let note="共 "+r.total+" 個目標,字典 "+r.cred_count+" 組";
-  if(r.truncated) note+="(已截斷至上限)";
+  let note="共 "+r.total+" 個目標(含 CIDR 展開),字典 "+r.cred_count+" 組";
+  if(r.truncated) note+="(字典已截斷至上限)";
+  if(r.notes&&r.notes.length) note+="　⚠ "+r.notes.join("；");
   $("#progtxt").textContent=note+" — 掃描中…";
   poll=setInterval(checkStatus,1200);
 });
@@ -817,8 +997,12 @@ function render(results){
     '<span class="badge text-bg-danger">發現問題 '+vuln.length+' 台</span>'+
     '<span class="badge text-bg-success">無問題 '+okUp.length+' 台</span>'+
     '<span class="badge text-bg-secondary">無法連線 '+down.length+' 台</span>'+
-    '<span class="ms-auto">合計 <i class="bi bi-file-earmark-pdf"></i> PDF <b>'+pdf+
-    '</b> · <i class="bi bi-image"></i> 圖片 <b>'+img+'</b></span></div>';
+    '<span><i class="bi bi-file-earmark-pdf"></i> PDF <b>'+pdf+
+    '</b> · <i class="bi bi-image"></i> 圖片 <b>'+img+'</b></span>'+
+    '<span class="ms-auto d-flex gap-2">'+
+      '<a class="btn btn-sm btn-outline-light" href="/report/'+jobId+'.csv"><i class="bi bi-filetype-csv"></i> 匯出 CSV</a>'+
+      '<a class="btn btn-sm btn-outline-light" href="/report/'+jobId+'.html" target="_blank"><i class="bi bi-filetype-html"></i> 匯出 HTML</a>'+
+    '</span></div>';
 
   const box=$("#results"); box.innerHTML="";
   vuln.forEach(r=>box.appendChild(hostCard(r,true)));
