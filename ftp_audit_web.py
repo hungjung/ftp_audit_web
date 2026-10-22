@@ -129,28 +129,16 @@ def _apply_mode(ftp, mode):
     ftp.set_pasv(mode.get('passive', True))
 
 
-def _prime_pasv(ftp, timeout):
-    """對被動資料埠先做一次 TCP『敲門』連線再關閉,把有狀態防火牆/ALG 的
-    通道打開。專治『固定被動埠、首次資料連線被擋(426)』的伺服器。
-    對一般伺服器無害(頂多多一次連線),故可一律執行。"""
-    try:
-        host, port = ftp.makepasv()  # 送 PASV、取得資料位址(此版 makepasv 已含控制IP覆寫)
-        s = socket.create_connection((host, port), timeout)
-        s.close()
-    except Exception:
-        pass  # 敲門失敗不影響後續正式嘗試
-
-
 def _open_apply(host, port, user, password, mode, timeout):
-    """建立連線、套用資料連線模式、設二進位;被動模式則先『預敲』被動埠。"""
+    """建立連線、套用資料連線模式、設二進位。
+    注意:不可在列目錄前額外開啟任何資料連線(如預敲、先試 MLSD)——
+    有些伺服器『LIST 之前只要開過一次資料連線,下一次 LIST 就會 426』。"""
     ftp = ftp_connect(host, port, user, password, timeout)
     _apply_mode(ftp, mode)
     try:
-        ftp.voidcmd('TYPE I')
+        ftp.voidcmd('TYPE I')  # 僅送控制指令,不開資料連線;retrlines 會自行改回 TYPE A
     except Exception:
         pass
-    if mode.get('passive'):
-        _prime_pasv(ftp, timeout)
     return ftp
 
 
@@ -298,7 +286,22 @@ def _list_dir(ftp, path):
           只有『目錄確實是空的』才回 []。"""
     ftp.cwd(path or '/')  # 切不進去 → 拋出,呼叫端處理
 
-    # 1) MLSD(不帶參數)
+    # 1) LIST(不帶參數)—— 優先,且只開『一次』資料連線。
+    #    不先試 MLSD:ftplib 的 MLSD 會先開資料連線才收到 502,
+    #    這會干擾『固定被動埠』伺服器,害接下來的 LIST 426。
+    #    資料傳輸錯誤(426 等)會往外拋,交呼叫端重連重試;
+    #    只有 LIST 指令本身不被支援(error_perm)才退回 MLSD。
+    try:
+        lines = []
+        ftp.retrlines('LIST', lines.append)
+        parsed = [r for r in (_parse_list_line(ln) for ln in lines) if r]
+        if parsed or not lines:
+            return parsed  # 有解析到內容,或確實是空目錄
+        # LIST 有回內容但一行都解析不出 → 落到 MLSD 嘗試補救
+    except ftplib.error_perm:
+        pass  # LIST 不被支援(極罕見)→ 試 MLSD
+
+    # 2) MLSD(不帶參數)
     try:
         out = []
         for name, facts in ftp.mlsd():
@@ -310,17 +313,9 @@ def _list_dir(ftp, path):
             elif typ == 'file':
                 sz = facts.get('size')
                 out.append((name, False, int(sz) if sz and sz.isdigit() else None))
-        return out  # MLSD 成功(即使空)
+        return out
     except ftplib.error_perm:
-        pass  # MLSD 不支援 → 往下試 LIST
-
-    # 2) LIST(不帶參數);若為資料傳輸錯誤(426 等)則往外拋,交呼叫端重連
-    try:
-        lines = []
-        ftp.retrlines('LIST', lines.append)
-        return [r for r in (_parse_list_line(ln) for ln in lines) if r]
-    except ftplib.error_perm:
-        pass  # LIST 不被允許 → 試 NLST(此分支連線未被資料傳輸弄髒)
+        pass  # MLSD 不支援 → 試 NLST
 
     # 3) NLST(不帶參數)+ SIZE
     out = []
