@@ -826,32 +826,47 @@ def _fmt_size(n):
     return '%.1f MB' % (n / 1048576)
 
 
-# 自成一體、不依賴外網的 HTML 報告模板
+# 自成一體、不依賴外網的 HTML 報告模板(淺底色,適合列印紙本)
 _REPORT_TMPL = """<!doctype html>
 <html lang="zh-Hant"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>FTP 資安稽核報告</title>
 <style>
  body{font-family:system-ui,"Noto Sans TC","Microsoft JhengHei",sans-serif;
-      margin:0;background:#0e131b;color:#e3e8ef}
- .wrap{max-width:1000px;margin:0 auto;padding:24px}
- h1{font-size:20px} h3{font-size:15px;font-family:ui-monospace,monospace;margin:0 0 8px}
+      margin:0;background:#ffffff;color:#1a1a1a}
+ .wrap{max-width:1000px;margin:0 auto;padding:28px 24px}
+ h1{font-size:21px;margin:0 0 4px}
+ h3{font-size:15px;font-family:ui-monospace,monospace;margin:0 0 8px;color:#111}
+ .warn{color:#9a6a00;font-size:12.5px;margin-bottom:4px}
  .sum{display:flex;flex-wrap:wrap;gap:10px;margin:14px 0 22px}
- .sum span{background:#1a2230;border:1px solid #2a3545;border-radius:8px;padding:6px 12px;font-size:13px}
- .host{border:1px solid #2a3545;border-radius:10px;padding:14px 16px;margin-bottom:12px;background:#141b26}
- .host.v{border-left:4px solid #f87171}
- .tag{font-size:11.5px;padding:2px 9px;border-radius:99px;font-weight:700;margin-left:6px}
- .anon{background:#3b2a05;color:#fbbf24} .weak{background:#3a1218;color:#f87171}
- .ok{background:#10281a;color:#4ade80} .off{background:#1e2530;color:#8491a5}
- .muted{color:#8491a5;font-size:13px;margin:4px 0} .muted b{color:#e3e8ef}
- .creds{font-family:ui-monospace,monospace;font-size:12.5px;color:#f87171;margin:4px 0}
+ .sum span{background:#f3f5f8;border:1px solid #d6dbe2;border-radius:8px;padding:6px 12px;font-size:13px}
+ .sum b{color:#111}
+ .host{border:1px solid #d6dbe2;border-radius:10px;padding:14px 16px;margin-bottom:12px;
+       background:#fafbfc;page-break-inside:avoid}
+ .host.v{border-left:4px solid #d12b3b;background:#fdf6f6}
+ .tag{font-size:11.5px;padding:2px 9px;border-radius:99px;font-weight:700;margin-left:6px;
+      border:1px solid transparent}
+ .anon{background:#fff3cd;color:#8a6100;border-color:#f0dca0}
+ .weak{background:#fbe0e2;color:#b02231;border-color:#f2b8bd}
+ .ok{background:#def5e5;color:#1f7a44;border-color:#aedcc0}
+ .off{background:#eceff3;color:#5a6676;border-color:#d4dae2}
+ .muted{color:#5a6676;font-size:13px;margin:4px 0} .muted b{color:#111}
+ .creds{font-family:ui-monospace,monospace;font-size:12.5px;color:#b02231;margin:4px 0}
  table{width:100%%;border-collapse:collapse;margin-top:10px;font-size:12.5px}
- th,td{text-align:left;padding:5px 8px;border-bottom:1px solid #222c3a}
- th{color:#8491a5;font-weight:600} .mono{font-family:ui-monospace,monospace;color:#9fb0c7}
- .warn{color:#fbbf24;font-size:12.5px}
- .foot{color:#60708a;font-size:12px;margin-top:24px}
+ th,td{text-align:left;padding:5px 8px;border-bottom:1px solid #e3e7ec}
+ th{color:#5a6676;font-weight:600;background:#f3f5f8}
+ .mono{font-family:ui-monospace,monospace;color:#3a4a5e}
+ .foot{color:#8a95a3;font-size:12px;margin-top:24px}
+ @media print{
+   @page{margin:14mm}
+   body{background:#fff}
+   .wrap{max-width:none;padding:0}
+   /* 確保各色塊、底色在列印時照常印出 */
+   *{-webkit-print-color-adjust:exact;print-color-adjust:exact}
+   .host{box-shadow:none}
+ }
 </style></head><body><div class="wrap">
- <h1>🛡️ FTP 資安稽核報告</h1>
+ <h1>FTP 資安稽核報告</h1>
  <div class="warn">⚠ 僅限對已獲授權之機關主機使用　|　產生時間:%(time)s</div>
  <div class="sum">
    <span>共 <b>%(total)d</b> 台</span>
