@@ -189,15 +189,19 @@ def _join(path, name):
 
 
 def _display_name(name):
-    """連線用 latin-1 解碼;若檔名其實是 Big5/CP950,還原成可讀中文供顯示。
-    (FTP 指令仍用原始 latin-1 字串,確保下載路徑位元組正確)"""
+    """連線用 latin-1 解碼;還原檔名真正的編碼供顯示(先試 UTF-8,再試 Big5/CP950)。
+    FTP 指令仍用原始 latin-1 字串,確保下載路徑位元組正確。"""
     try:
-        decoded = name.encode('latin-1').decode('cp950')
-        # 僅在解出非 ASCII(即確實是中文)時採用,避免誤判
-        if any(ord(c) > 127 for c in decoded):
-            return decoded
+        raw = name.encode('latin-1')
     except Exception:
-        pass
+        return name
+    for enc in ('utf-8', 'cp950', 'big5'):
+        try:
+            dec = raw.decode(enc)
+        except Exception:
+            continue
+        if any(ord(c) > 127 for c in dec):  # 解出中文才採用;純 ASCII 保留原樣
+            return dec
     return name
 
 
@@ -264,14 +268,12 @@ def _list_dir(ftp, path):
     """回傳 [(name, is_dir, size)]。
     先 CWD 切進目標目錄,再用『不帶參數』的指令列出 —— 有些伺服器不接受
     LIST/MLSD/NLST 帶路徑(會回 426 或錯誤),只接受列出當前目錄。
-    三層後備:MLSD → LIST 解析 → NLST + SIZE。"""
-    # 先切換到目標目錄;切不進去就當作無法列出
-    try:
-        ftp.cwd(path or '/')
-    except Exception:
-        return []
+    三層:MLSD → LIST → NLST+SIZE。
+    注意:資料傳輸類錯誤(如 426)會『往外拋出』,交給呼叫端重連重試;
+          只有『目錄確實是空的』才回 []。"""
+    ftp.cwd(path or '/')  # 切不進去 → 拋出,呼叫端處理
 
-    # 1) MLSD(不帶參數,列當前目錄)
+    # 1) MLSD(不帶參數)
     try:
         out = []
         for name, facts in ftp.mlsd():
@@ -283,75 +285,129 @@ def _list_dir(ftp, path):
             elif typ == 'file':
                 sz = facts.get('size')
                 out.append((name, False, int(sz) if sz and sz.isdigit() else None))
-        if out:
-            return out
-    except Exception:
-        pass
-    # 2) LIST(不帶參數)解析(標準 ls -l / IIS 格式;最通用的後備)
+        return out  # MLSD 成功(即使空)
+    except ftplib.error_perm:
+        pass  # MLSD 不支援 → 往下試 LIST
+
+    # 2) LIST(不帶參數);若為資料傳輸錯誤(426 等)則往外拋,交呼叫端重連
     try:
         lines = []
         ftp.retrlines('LIST', lines.append)
-        out = []
-        for ln in lines:
-            r = _parse_list_line(ln)
-            if r:
-                out.append(r)
-        if out:
-            return out
-    except Exception:
-        pass
-    # 3) 最後手段:NLST(不帶參數)+ SIZE
+        return [r for r in (_parse_list_line(ln) for ln in lines) if r]
+    except ftplib.error_perm:
+        pass  # LIST 不被允許 → 試 NLST(此分支連線未被資料傳輸弄髒)
+
+    # 3) NLST(不帶參數)+ SIZE
     out = []
-    try:
-        names = ftp.nlst()
-    except Exception:
-        return out
+    names = ftp.nlst()
     for n in names:
         base = n.rsplit('/', 1)[-1]
         if base in ('.', '..'):
             continue
         sz, is_dir = None, False
         try:
-            ftp.voidcmd('TYPE I')  # 重設二進位,否則 SIZE 在 ASCII 模式會被拒
+            ftp.voidcmd('TYPE I')
             sz = ftp.size(base)
             is_dir = (sz is None)
         except Exception:
-            # 無法判定:用副檔名輔助 — 有已知副檔名就當檔案,否則當目錄
             ext = os.path.splitext(base)[1].lower()
             is_dir = ext not in IMAGE_EXTS and ext not in PDF_EXTS
         out.append((base, is_dir, sz))
     return out
 
 
-def scan_with_fallback(host, port, user, password, timeout):
-    """掃描檔案,依序嘗試多種資料連線模式,選第一個可用者。
-    回傳 (files, mode)。全部失敗則拋出例外(避免默默回 0)。"""
-    last_err = None
-    for mode in DATA_MODES:
-        # 被動模式重試 2 次:有些防火牆/ALG 的固定被動埠需「先敲一次才開孔」,
-        # 第一次 426、第二次才通。主動模式只試 1 次(失敗多為逾時,重試只是空等)。
-        tries = 2 if mode['passive'] else 1
+def _walk_fresh(host, port, user, password, mode, start, timeout,
+                max_depth=MAX_DEPTH, max_files=MAX_FILES_PER_HOST, tries=4):
+    """遞迴掃描:每個目錄都用『全新連線』列出,並在失敗時重試重連。
+    專治『固定單一被動埠、連續連線易 426』的伺服器——單一目錄失敗不會
+    拖垮整體;某目錄多次重試仍失敗就略過該目錄。"""
+    found = []
+    visited = set()
+    stack = [(start, 0)]
+    while stack and len(found) < max_files:
+        path, depth = stack.pop()
+        key = path or '/'
+        if key in visited or depth > max_depth:
+            continue
+        visited.add(key)
+
+        entries = None
         for attempt in range(tries):
+            ftp = None
             try:
                 ftp = ftp_connect(host, port, user, password, timeout)
-            except Exception as e:
-                last_err = e
-                break  # 控制連線都建不起來,換下一模式
-            try:
                 _apply_mode(ftp, mode)
-                ftp.retrlines('LIST', lambda _l: None)  # 探測此模式資料連線
+                try:
+                    ftp.voidcmd('TYPE I')
+                except Exception:
+                    pass
+                entries = _list_dir(ftp, path)
+                break  # 成功
+            except Exception:
+                entries = None  # 多為 426,重連再試
+            finally:
+                if ftp is not None:
+                    _close(ftp)
+            if attempt + 1 < tries:
+                time.sleep(0.4)
+        if entries is None:
+            continue  # 此目錄實在列不出 → 略過,不中斷整體
+
+        for name, is_dir, size in entries:
+            if is_dir:
+                stack.append((_join(path, name), depth + 1))
+                continue
+            ext = os.path.splitext(name)[1].lower()
+            if ext in IMAGE_EXTS:
+                kind = 'image'
+            elif ext in PDF_EXTS:
+                kind = 'pdf'
+            else:
+                continue
+            found.append({'path': _join(path, name),
+                          'name': _display_name(name),
+                          'ext': ext, 'kind': kind, 'size': size})
+            if len(found) >= max_files:
+                break
+    return found
+
+
+def scan_with_fallback(host, port, user, password, timeout):
+    """掃描檔案,依序嘗試多種資料連線模式,選第一個可用者。
+    回傳 (files, mode)。全部失敗則拋出例外(避免默默回 0)。
+    對每個模式先『用全新連線 + 重試』驗證能列出起始目錄,再以
+    _walk_fresh(每目錄全新連線)完成整個掃描,耐受固定被動埠的 flaky 行為。"""
+    last_err = None
+    for mode in DATA_MODES:
+        # 被動模式多試幾次:固定被動埠常「第一次 426、重連才通」。主動模式只試 1 次。
+        tries = 4 if mode['passive'] else 1
+        start, ok = '/', False
+        for attempt in range(tries):
+            ftp = None
+            try:
+                ftp = ftp_connect(host, port, user, password, timeout)
+                _apply_mode(ftp, mode)
+                try:
+                    ftp.voidcmd('TYPE I')
+                except Exception:
+                    pass
+                start = ftp.pwd() or '/'
+                _list_dir(ftp, start)  # 能列出起始目錄才算此模式可用(拋出即失敗)
+                ok = True
             except Exception as e:
                 last_err = '%s(第%d次): %s' % (mode['label'], attempt + 1, e)
-                _close(ftp)
-                if attempt + 1 < tries:
-                    time.sleep(0.4)
-                continue
-            # 此模式可用 → 正式掃描
-            try:
-                files = walk_ftp(ftp)
-                return files, mode
             finally:
-                _close(ftp)
+                if ftp is not None:
+                    _close(ftp)
+            if ok:
+                break
+            if attempt + 1 < tries:
+                time.sleep(0.4)
+        if not ok:
+            continue
+        # 此模式可用 → 用每目錄全新連線的 walk 完成掃描
+        files = _walk_fresh(host, port, user, password, mode, start, timeout)
+        return files, mode
     raise IOError('資料連線在所有模式皆失敗 (最後錯誤 %s)' % last_err)
 
 
@@ -376,7 +432,11 @@ def walk_ftp(ftp, start=None, max_depth=MAX_DEPTH, max_files=MAX_FILES_PER_HOST)
         if key in visited or depth > max_depth:
             continue
         visited.add(key)
-        for name, is_dir, size in _list_dir(ftp, path):
+        try:
+            entries = _list_dir(ftp, path)
+        except Exception:
+            entries = []  # 此連線列不出(如 426);單連線版不重連,略過
+        for name, is_dir, size in entries:
             if is_dir:
                 stack.append((_join(path, name), depth + 1))
                 continue
