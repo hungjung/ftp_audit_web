@@ -38,10 +38,14 @@ import argparse
 import ftplib
 import io
 import os
+import re
 import socket
 import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+_MONTHS = {'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+           'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'}
 
 from flask import Flask, request, jsonify, Response, abort
 
@@ -157,35 +161,20 @@ def _join(path, name):
 
 def _parse_list_line(line):
     """解析 LIST 回傳的一行,回傳 (name, is_dir, size) 或 None。
-    支援 Unix (ls -l) 與 MS-DOS/IIS 兩種格式。"""
+    支援 Unix (ls -l,含欄位數不同的變體) 與 MS-DOS/IIS 兩種格式。"""
     line = line.rstrip('\r\n')
     if not line.strip():
         return None
-    first = line[0]
-    # Unix 格式:  drwxr-xr-x  2 root root 4096 Oct 22 16:32 name
-    if first in 'd-lcbps':
-        parts = line.split(None, 8)
-        if len(parts) < 9:
-            return None
-        is_dir = (first == 'd')
-        is_link = (first == 'l')
-        try:
-            size = int(parts[4])
-        except (ValueError, IndexError):
-            size = None
-        name = parts[8]
-        if is_link:
-            name = name.split(' -> ')[0]  # 符號連結取箭頭前的名稱
-            is_dir = False                # 連結一律當檔案,避免誤遞迴
-            size = None
-        if name in ('.', '..'):
-            return None
-        return (name, is_dir, size)
-    # MS-DOS/IIS 格式:  12-05-19  10:12AM  <DIR>  name   或   ... 1024 name
-    parts = line.split(None, 3)
-    if len(parts) >= 4:
-        token, name = parts[2], parts[3]
-        if name in ('.', '..'):
+    tokens = line.split()
+    if not tokens:
+        return None
+
+    # MS-DOS / IIS 格式:  07-17-26  12:53PM  <DIR>  name   或   ... 318976 name
+    if re.match(r'^\d\d-\d\d-\d{2,4}$', tokens[0]) and len(tokens) >= 4:
+        token = tokens[2]
+        rest = line.split(None, 3)
+        name = rest[3] if len(rest) > 3 else None
+        if not name or name in ('.', '..'):
             return None
         if token.upper() == '<DIR>':
             return (name, True, None)
@@ -193,6 +182,39 @@ def _parse_list_line(line):
             return (name, False, int(token))
         except ValueError:
             return (name, False, None)
+
+    # Unix 格式:  -rwx------ 1 user group 318976 Jul 17 2026 name
+    # (有些伺服器缺群組欄或欄數不同,故以「月份欄」來定位檔名,不假設固定欄數)
+    first = line[0]
+    if first in 'd-lcbps':
+        is_dir = (first == 'd')
+        is_link = (first == 'l')
+        name, size = None, None
+        for i in range(1, len(tokens) - 1):
+            if tokens[i] in _MONTHS and i + 2 < len(tokens):
+                try:
+                    size = int(tokens[i - 1])  # 月份前一欄為大小
+                except (ValueError, IndexError):
+                    size = None
+                parts = line.split(None, i + 3)  # 月、日、時間/年 之後即檔名
+                name = parts[i + 3] if len(parts) > i + 3 else None
+                break
+        if name is None:  # 找不到月份欄時,退回標準 9 欄假設
+            parts = line.split(None, 8)
+            if len(parts) >= 9:
+                name = parts[8]
+                try:
+                    size = int(parts[4])
+                except (ValueError, IndexError):
+                    size = None
+        if not name or name in ('.', '..'):
+            return None
+        if is_link:
+            name = name.split(' -> ')[0]  # 符號連結取箭頭前的名稱
+            is_dir = False                # 連結一律當檔案,避免誤遞迴
+            size = None
+        return (name, is_dir, size)
+
     return None
 
 
