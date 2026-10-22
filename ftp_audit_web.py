@@ -129,6 +129,31 @@ def _apply_mode(ftp, mode):
     ftp.set_pasv(mode.get('passive', True))
 
 
+def _prime_pasv(ftp, timeout):
+    """對被動資料埠先做一次 TCP『敲門』連線再關閉,把有狀態防火牆/ALG 的
+    通道打開。專治『固定被動埠、首次資料連線被擋(426)』的伺服器。
+    對一般伺服器無害(頂多多一次連線),故可一律執行。"""
+    try:
+        host, port = ftp.makepasv()  # 送 PASV、取得資料位址(此版 makepasv 已含控制IP覆寫)
+        s = socket.create_connection((host, port), timeout)
+        s.close()
+    except Exception:
+        pass  # 敲門失敗不影響後續正式嘗試
+
+
+def _open_apply(host, port, user, password, mode, timeout):
+    """建立連線、套用資料連線模式、設二進位;被動模式則先『預敲』被動埠。"""
+    ftp = ftp_connect(host, port, user, password, timeout)
+    _apply_mode(ftp, mode)
+    try:
+        ftp.voidcmd('TYPE I')
+    except Exception:
+        pass
+    if mode.get('passive'):
+        _prime_pasv(ftp, timeout)
+    return ftp
+
+
 def try_login(host, port, user, password, timeout):
     """嘗試一組帳密,成功回傳 True。"""
     try:
@@ -335,12 +360,7 @@ def _walk_fresh(host, port, user, password, mode, start, timeout,
         for attempt in range(tries):
             ftp = None
             try:
-                ftp = ftp_connect(host, port, user, password, timeout)
-                _apply_mode(ftp, mode)
-                try:
-                    ftp.voidcmd('TYPE I')
-                except Exception:
-                    pass
+                ftp = _open_apply(host, port, user, password, mode, timeout)
                 entries = _list_dir(ftp, path)
                 break  # 成功
             except Exception:
@@ -385,12 +405,7 @@ def scan_with_fallback(host, port, user, password, timeout):
         for attempt in range(tries):
             ftp = None
             try:
-                ftp = ftp_connect(host, port, user, password, timeout)
-                _apply_mode(ftp, mode)
-                try:
-                    ftp.voidcmd('TYPE I')
-                except Exception:
-                    pass
+                ftp = _open_apply(host, port, user, password, mode, timeout)
                 start = ftp.pwd() or '/'
                 _list_dir(ftp, start)  # 能列出起始目錄才算此模式可用(拋出即失敗)
                 ok = True
@@ -545,9 +560,11 @@ def download_ftp_file(host, port, user, password, path, timeout, max_bytes, dmod
     d = d or '/'
 
     last_err = None
-    for mode in modes:
-        ftp = ftp_connect(host, port, user, password, timeout)
-        _apply_mode(ftp, mode)
+    # 每種模式各重試幾次(被動模式需預敲防火牆通道,偶爾仍需重連)
+    attempts = [(mode, t) for mode in modes
+                for t in range(4 if mode.get('passive') else 1)]
+    for mode, _t in attempts:
+        ftp = _open_apply(host, port, user, password, mode, timeout)  # 含被動預敲
         buf = io.BytesIO()
         state = {'n': 0}
 
@@ -558,7 +575,6 @@ def download_ftp_file(host, port, user, password, path, timeout, max_bytes, dmod
             buf.write(data)
 
         try:
-            ftp.voidcmd('TYPE I')
             try:
                 ftp.cwd(d)
             except Exception:
