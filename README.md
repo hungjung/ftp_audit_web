@@ -70,18 +70,26 @@
 
 ```
 ftp_audit/
+├─ docs/                     存放說明文件與截圖
+│  └─ screenshots/           存放介面截圖
+│     ├─ 01-form.png
+│     ├─ 02-results.png
+│     ├─ 03-preview.png
+│     └─ 04-report.png
+├─ static/                   本機自帶的前端資源(勿更動結構)
+│  ├─ bootstrap.min.css
+│  ├─ bootstrap.bundle.min.js
+│  ├─ bootstrap-icons.css
+│  └─ fonts/
+│     ├─ bootstrap-icons.woff2
+│     └─ bootstrap-icons.woff
+├─ wordlist/
+│  └─ creds.txt              字典檔(常見帳號密碼組合，供弱密碼檢測使用)
 ├─ ftp_audit_web.py          主程式(Web 介面)
 ├─ ftp_diag.py               單機診斷腳本(排查某台伺服器的連線問題)
 ├─ ftp_probe.py              列目錄「配方探測」腳本(測哪種做法可行)
 ├─ requirements.txt          相依套件清單
-├─ README.md                 本文件
-└─ static/                   本機自帶的前端資源(勿更動結構)
-   ├─ bootstrap.min.css
-   ├─ bootstrap.bundle.min.js
-   ├─ bootstrap-icons.css
-   └─ fonts/
-      ├─ bootstrap-icons.woff2
-      └─ bootstrap-icons.woff
+└─ README.md                 本文件
 ```
 
 ---
